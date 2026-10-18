@@ -68,23 +68,8 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     /// <summary>标题控件，用于在不同交换步骤间提示当前操作。</summary>
     private Label? _titleLabel;
 
-    /// <summary>状态控件，用于显示请求倒计时、等待对方等信息。</summary>
+    /// <summary>状态控件，用于显示当前步骤、回应提示或等待对方等信息。</summary>
     private Label? _statusLabel;
-
-    /// <summary>显示请求剩余时间的文字，帮助玩家准确判断回应时限。</summary>
-    private Label? _countdownLabel;
-
-    /// <summary>按请求剩余时间逐渐耗尽的可视化进度条。</summary>
-    private ProgressBar? _requestProgressBar;
-
-    /// <summary>请求倒计时尚余秒数；由 Godot 每帧传入的 delta 递减。</summary>
-    private double _requestSecondsRemaining;
-
-    /// <summary>当前倒计时显示的提示文字，例如“回应剩余”或“等待回应”。</summary>
-    private string _requestCountdownDescription = string.Empty;
-
-    /// <summary>只有正在等待回应的请求才启用本地动画倒计时。</summary>
-    private bool _isRequestCountdownActive;
 
     /// <summary>显示玩家按钮或卡牌按钮的列表容器。</summary>
     private VBoxContainer? _itemsContainer;
@@ -170,29 +155,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         _statusLabel.AddThemeFontSizeOverride("font_size", 18);
         layout.AddChild(_statusLabel);
 
-        // 将文字倒计时和进度条放在玩家列表之前，使请求时限在弹窗中醒目可见。
-        _countdownLabel = new Label
-        {
-            Text = string.Empty,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Visible = false
-        };
-        _countdownLabel.AddThemeFontSizeOverride("font_size", 16);
-        layout.AddChild(_countdownLabel);
-
-        // 进度条初始为满格；请求经过五秒后逐渐归零，与主持端超时判定同步。
-        _requestProgressBar = new ProgressBar
-        {
-            MinValue = 0,
-            MaxValue = 100,
-            Value = 100,
-            ShowPercentage = false,
-            CustomMinimumSize = new Vector2(0, 14),
-            SizeFlagsHorizontal = SizeFlags.ExpandFill,
-            Visible = false
-        };
-        layout.AddChild(_requestProgressBar);
-
         var scroll = new ScrollContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
@@ -241,8 +203,7 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     public void ShowPlayers(IEnumerable<(string PlayerId, string DisplayName, bool CanRequest)> players)
     {
         ClearItems();
-        StopRequestCountdown();
-        SetHeader("选择交换对象", "点击玩家昵称发送交换请求；请求五秒内未获回应会自动撤销。");
+        SetHeader("选择交换对象", "点击玩家昵称发送交换请求；请求会一直等待，直到对方同意或拒绝。");
         SetResponseButtonsVisible(false);
 
         foreach ((string playerId, string displayName, bool canRequest) in players)
@@ -259,20 +220,18 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     }
 
     /// <summary>显示一条发给当前玩家的请求，并展示同意/拒绝按钮。</summary>
-    public void ShowIncomingRequest(string initiatorName, double secondsRemaining)
+    public void ShowIncomingRequest(string initiatorName)
     {
         ClearItems();
-        SetHeader("收到交换请求", $"{initiatorName} 想与你交换一张卡牌，请在倒计时结束前回应。");
-        StartRequestCountdown(secondsRemaining, "回应剩余");
+        SetHeader("收到交换请求", $"{initiatorName} 想与你交换一张卡牌，请选择同意或拒绝。");
         SetResponseButtonsVisible(true);
     }
 
-    /// <summary>让发起者也能看到对方回应请求的剩余时间和进度。</summary>
-    public void ShowOutgoingRequest(string recipientName, double secondsRemaining)
+    /// <summary>让发起者看到请求已送达，并提示需要等待对方明确回应。</summary>
+    public void ShowOutgoingRequest(string recipientName)
     {
         ClearItems();
-        SetHeader("等待玩家回应", $"已向 {recipientName} 发送交换请求；对方未及时回应时请求会自动撤销。");
-        StartRequestCountdown(secondsRemaining, "等待回应");
+        SetHeader("等待玩家回应", $"已向 {recipientName} 发送交换请求，请等待对方同意或拒绝。");
         SetResponseButtonsVisible(false);
     }
 
@@ -280,7 +239,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     public void ShowCardSelectionWaiting(string message)
     {
         ClearItems();
-        StopRequestCountdown();
         SetHeader("选择一张卡牌", message);
         SetResponseButtonsVisible(false);
     }
@@ -297,28 +255,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         int safeTotal = Math.Max(0, totalPlayers);
         int safeSkipped = Math.Clamp(skippedPlayers, 0, safeTotal);
         _skipButton.Text = $"跳过 {safeSkipped}/{safeTotal}";
-    }
-
-    /// <summary>每帧更新本地显示；真正的超时裁决仍由主持端统一完成并广播。</summary>
-    public override void _Process(double delta)
-    {
-        if (!_isRequestCountdownActive || _countdownLabel is null || _requestProgressBar is null)
-        {
-            return;
-        }
-
-        // delta 是 Godot 当前帧经过的秒数；用它而非帧数递减，保证不同帧率下倒计时速度一致。
-        _requestSecondsRemaining = Math.Max(0, _requestSecondsRemaining - delta);
-        _requestProgressBar.Value = _requestSecondsRemaining / TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds * 100.0;
-        _countdownLabel.Text = _requestSecondsRemaining > 0
-            ? $"{_requestCountdownDescription}：{_requestSecondsRemaining:0.0} 秒"
-            : "请求已到期，正在同步撤销……";
-
-        // 本地动画到零后停止更新，但保留零格进度和到期提示，直到主持端状态消息到达。
-        if (_requestSecondsRemaining <= 0)
-        {
-            _isRequestCountdownActive = false;
-        }
     }
 
     /// <summary>显示等待状态，例如等待另一名玩家回应或确认卡牌。</summary>
@@ -359,45 +295,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         if (_declineButton is not null)
         {
             _declineButton.Visible = visible;
-        }
-    }
-
-    /// <summary>启动请求倒计时显示，并按剩余时间初始化进度条。</summary>
-    private void StartRequestCountdown(double secondsRemaining, string description)
-    {
-        _requestSecondsRemaining = Math.Clamp(
-            secondsRemaining,
-            0,
-            TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds);
-        _requestCountdownDescription = description;
-        _isRequestCountdownActive = _requestSecondsRemaining > 0;
-
-        if (_countdownLabel is not null)
-        {
-            _countdownLabel.Visible = true;
-            _countdownLabel.Text = $"{_requestCountdownDescription}：{_requestSecondsRemaining:0.0} 秒";
-        }
-
-        if (_requestProgressBar is not null)
-        {
-            _requestProgressBar.Visible = true;
-            _requestProgressBar.Value = _requestSecondsRemaining /
-                TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds * 100.0;
-        }
-    }
-
-    /// <summary>离开请求等待界面时隐藏并停止倒计时，避免旧请求时间残留到其他步骤。</summary>
-    private void StopRequestCountdown()
-    {
-        _isRequestCountdownActive = false;
-        if (_countdownLabel is not null)
-        {
-            _countdownLabel.Visible = false;
-        }
-
-        if (_requestProgressBar is not null)
-        {
-            _requestProgressBar.Visible = false;
         }
     }
 

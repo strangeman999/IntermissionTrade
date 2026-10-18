@@ -45,7 +45,7 @@ public enum TradeStateKind : byte
     /// <summary>接收玩家已拒绝该请求。</summary>
     RequestDeclined = 3,
 
-    /// <summary>请求超过五秒无人回应而撤销。</summary>
+    /// <summary>旧版协议保留的状态编号；当前版本不再发送请求超时消息。</summary>
     RequestTimedOut = 4,
 
     /// <summary>一名玩家提交了自己的卡牌选择。</summary>

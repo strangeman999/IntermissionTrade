@@ -69,6 +69,36 @@ internal static class TradePhaseRuntime
     }
 
     /// <summary>
+    /// 在游戏放弃当前牌局前清理幕间交换状态和覆盖层，
+    /// 避免暂停的切幕同步器或模态界面残留并阻止游戏返回主菜单。
+    /// </summary>
+    public static void CleanupForRunAbandonment()
+    {
+        // 使尚未返回的原生选牌任务失效；任务稍后结束时不会再把错误状态写回新界面。
+        _activeCardSelectionKey = null;
+
+        if (_cardSelectionScreen is not null && GodotObject.IsInstanceValid(_cardSelectionScreen))
+        {
+            NOverlayStack.Instance?.Remove(_cardSelectionScreen);
+            _cardSelectionScreen.QueueFree();
+        }
+
+        _cardSelectionScreen = null;
+
+        if (_screen is not null && GodotObject.IsInstanceValid(_screen))
+        {
+            _screen.Close();
+        }
+
+        _screen = null;
+        _heldActChangeSynchronizer = null;
+        _runState = null;
+        _phaseEndReceived = false;
+        _allowNextActTransition = false;
+        Coordinator.ResetForRunEnd();
+    }
+
+    /// <summary>
     /// 被 Harmony 切幕前缀调用。若此刻是第一幕或第二幕，先暂停原切幕，等待交换流程完成。
     /// 第三幕结束或单人游戏时返回 true，让原游戏直接继续。
     /// </summary>
@@ -202,15 +232,14 @@ internal static class TradePhaseRuntime
         // 主持端刚刚直接更新过协调器；只刷新界面，再广播给客户端应用一次。
         RefreshScreen();
         TradeNetworkRouter.BroadcastState(state);
-        StartHostRequestTimeout(request);
     }
 
     /// <summary>只允许指定接收者回应仍有效的请求；拒绝后不会消耗发起者的机会。</summary>
     private static void HandleResponseIntent(TradeIntentMessage intent, DateTimeOffset now, bool accepted)
     {
         bool changed = accepted
-            ? Coordinator.AcceptRequest(PlayerKey(intent.ActorNetId), now)
-            : Coordinator.DeclineRequest(PlayerKey(intent.ActorNetId), now);
+            ? Coordinator.AcceptRequest(PlayerKey(intent.ActorNetId))
+            : Coordinator.DeclineRequest(PlayerKey(intent.ActorNetId));
 
         if (!changed)
         {
@@ -477,23 +506,14 @@ internal static class TradePhaseRuntime
                     PlayerKey(message.ActorNetId),
                     PlayerKey(message.TargetNetId),
                     new DateTimeOffset(message.TimestampUtcTicks, TimeSpan.Zero));
-                StartHostRequestTimeout(Coordinator.PendingRequest);
                 RefreshScreen();
                 break;
             case TradeStateKind.RequestAccepted:
-                Coordinator.AcceptRequest(
-                    PlayerKey(message.ActorNetId),
-                    new DateTimeOffset(message.TimestampUtcTicks, TimeSpan.Zero));
+                Coordinator.AcceptRequest(PlayerKey(message.ActorNetId));
                 RefreshScreen();
                 break;
             case TradeStateKind.RequestDeclined:
-                Coordinator.DeclineRequest(
-                    PlayerKey(message.ActorNetId),
-                    new DateTimeOffset(message.TimestampUtcTicks, TimeSpan.Zero));
-                RefreshScreen();
-                break;
-            case TradeStateKind.RequestTimedOut:
-                Coordinator.ExpireRequestIfNeeded(new DateTimeOffset(message.TimestampUtcTicks, TimeSpan.Zero));
+                Coordinator.DeclineRequest(PlayerKey(message.ActorNetId));
                 RefreshScreen();
                 break;
             case TradeStateKind.CardSelected:
@@ -531,57 +551,6 @@ internal static class TradePhaseRuntime
         }
 
         OpenAndBindScreen();
-    }
-
-    /// <summary>仅主持端启动五秒计时，到期后广播超时状态。</summary>
-    private static void StartHostRequestTimeout(TradeRequestSnapshot? request)
-    {
-        if (request is null || RunManager.Instance.NetService.Type != NetGameType.Host)
-        {
-            return;
-        }
-
-        // 计时器必须挂在当前游戏场景树上。幕间覆盖层已经打开时优先使用它所属的场景树，
-        // 再回退到覆盖层栈，避免 NRun 在奖励弹窗或幕切换过程中暂不可用而导致超时不启动。
-        SceneTree? sceneTree = null;
-        if (_screen is not null && GodotObject.IsInstanceValid(_screen))
-        {
-            sceneTree = _screen.GetTree();
-        }
-
-        sceneTree ??= NOverlayStack.Instance?.GetTree();
-        if (sceneTree is null)
-        {
-            MainFile.Logger.Error("无法取得游戏场景树，交换请求的主持端超时计时器未能启动。");
-            return;
-        }
-
-        string initiatorId = request.InitiatorId;
-        string recipientId = request.RecipientId;
-        long deadlineTicks = request.ResponseDeadline.UtcTicks;
-        double secondsRemaining = Math.Max(0, (request.ResponseDeadline - DateTimeOffset.UtcNow).TotalSeconds);
-        SceneTreeTimer timer = sceneTree.CreateTimer(secondsRemaining);
-        timer.Timeout += () =>
-        {
-            TradeRequestSnapshot? pending = Coordinator.PendingRequest;
-            if (pending is null ||
-                pending.InitiatorId != initiatorId ||
-                pending.RecipientId != recipientId ||
-                pending.ResponseDeadline.UtcTicks != deadlineTicks ||
-                !Coordinator.ExpireRequestIfNeeded(DateTimeOffset.UtcNow))
-            {
-                return;
-            }
-
-            var state = new TradeStateMessage(
-                TradeStateKind.RequestTimedOut,
-                Coordinator.ActNumber,
-                ParsePlayerKey(initiatorId),
-                ParsePlayerKey(recipientId),
-                timestampUtcTicks: deadlineTicks);
-            TradeNetworkRouter.BroadcastState(state);
-            RefreshScreen();
-        };
     }
 
     /// <summary>根据当前状态刷新本机面板内容，卡牌列表始终来自本机玩家自己的整副牌组。</summary>
@@ -623,20 +592,19 @@ internal static class TradePhaseRuntime
 
         if (pending.Status == TradeRequestStatus.AwaitingResponse)
         {
-            double secondsRemaining = Math.Max(0, (pending.ResponseDeadline - DateTimeOffset.UtcNow).TotalSeconds);
             if (pending.RecipientId == localKey)
             {
                 string initiatorName = PlatformUtil.GetPlayerNameRaw(
                     RunManager.Instance.NetService.Platform,
                     ParsePlayerKey(pending.InitiatorId));
-                _screen.ShowIncomingRequest(initiatorName, secondsRemaining);
+                _screen.ShowIncomingRequest(initiatorName);
             }
             else if (pending.InitiatorId == localKey)
             {
                 string recipientName = PlatformUtil.GetPlayerNameRaw(
                     RunManager.Instance.NetService.Platform,
                     ParsePlayerKey(pending.RecipientId));
-                _screen.ShowOutgoingRequest(recipientName, secondsRemaining);
+                _screen.ShowOutgoingRequest(recipientName);
             }
             else
             {
@@ -871,4 +839,12 @@ internal static class IntermissionTradeActTransitionPatch
     /// <summary>返回 false 暂停原函数；阶段结束后通过运行时的继续标记放行。</summary>
     private static bool Prefix(ActChangeSynchronizer __instance) =>
         TradePhaseRuntime.TryPauseBeforeNextAct(__instance);
+}
+
+/// <summary>牌局被玩家放弃时清理交换流程，确保游戏原有的返回主菜单步骤可以继续。</summary>
+[HarmonyPatch(typeof(RunManager), nameof(RunManager.Abandon))]
+internal static class IntermissionTradeRunAbandonPatch
+{
+    /// <summary>在原游戏执行放弃和断开联机之前移除交换覆盖层并释放暂停状态。</summary>
+    private static void Prefix() => TradePhaseRuntime.CleanupForRunAbandonment();
 }

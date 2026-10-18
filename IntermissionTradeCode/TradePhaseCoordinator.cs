@@ -36,9 +36,6 @@ public enum TradeRequestStatus
     /// <summary>请求被接收玩家拒绝。</summary>
     Declined,
 
-    /// <summary>请求超过五秒仍未得到回应，已自动撤销。</summary>
-    TimedOut,
-
     /// <summary>实际转移卡牌失败，撤销本笔交易且不消耗发起者机会。</summary>
     Failed
 }
@@ -58,11 +55,8 @@ public sealed class TradeRequestSnapshot
     /// <summary>当前请求状态。</summary>
     public TradeRequestStatus Status { get; }
 
-    /// <summary>请求发出时间；超时判断由阶段协调器统一处理。</summary>
+    /// <summary>请求发出时间，供日志与本地流程诊断使用。</summary>
     public DateTimeOffset CreatedAt { get; }
-
-    /// <summary>接收玩家回应请求的最后期限；固定为请求发出后五秒。</summary>
-    public DateTimeOffset ResponseDeadline { get; }
 
     /// <summary>发起者已选定并确认的卡牌标识；尚未确认时为 null。</summary>
     public string? InitiatorCardId { get; }
@@ -76,7 +70,6 @@ public sealed class TradeRequestSnapshot
         string recipientId,
         TradeRequestStatus status,
         DateTimeOffset createdAt,
-        DateTimeOffset responseDeadline,
         string? initiatorCardId,
         string? recipientCardId)
     {
@@ -84,7 +77,6 @@ public sealed class TradeRequestSnapshot
         RecipientId = recipientId;
         Status = status;
         CreatedAt = createdAt;
-        ResponseDeadline = responseDeadline;
         InitiatorCardId = initiatorCardId;
         RecipientCardId = recipientCardId;
     }
@@ -99,9 +91,6 @@ public sealed class TradeRequestSnapshot
 /// </summary>
 public sealed class TradePhaseCoordinator
 {
-    /// <summary>邀请玩家必须回应的时限。用户明确要求请求发出后五秒超时。</summary>
-    public static readonly TimeSpan RequestResponseTimeout = TimeSpan.FromSeconds(5);
-
     /// <summary>本阶段有效的幕编号；仅第一幕、第二幕允许交换。</summary>
     public int ActNumber { get; private set; }
 
@@ -168,22 +157,31 @@ public sealed class TradePhaseCoordinator
         return true;
     }
 
+    /// <summary>牌局结束或放弃时清空阶段数据，避免旧请求状态影响下一局。</summary>
+    public void ResetForRunEnd()
+    {
+        ActNumber = 0;
+        Status = TradePhaseStatus.NotStarted;
+        _playerIds.Clear();
+        _initiatorsWhoSucceeded.Clear();
+        _playersWhoSkipped.Clear();
+        PendingRequest = null;
+        LastResolvedRequest = null;
+    }
+
     /// <summary>
     /// 发起一笔交换请求。每个阶段只允许同一时间存在一笔请求或选牌流程。
-    /// 只有最终完成交换后才会消耗发起者机会；拒绝、超时都允许重试。
+    /// 只有最终完成交换后才会消耗发起者机会；对方拒绝后仍允许重试。
     /// </summary>
     /// <param name="initiatorId">发起玩家的稳定标识。</param>
     /// <param name="recipientId">接收玩家的稳定标识。</param>
-    /// <param name="now">由调用方传入的当前时间，便于联机权威端统一判定。</param>
+    /// <param name="now">记录请求发起时间，便于日志和本地流程诊断；请求不再自动超时。</param>
     /// <returns>成功创建的请求快照；规则不允许时返回 null。</returns>
     public TradeRequestSnapshot? TryCreateRequest(
         string initiatorId,
         string recipientId,
         DateTimeOffset now)
     {
-        // 每次处理新动作前先清理已过期请求，避免超时回调稍有延迟便阻塞下一次重试。
-        ExpireRequestIfNeeded(now);
-
         if (Status != TradePhaseStatus.InProgress ||
             PendingRequest is not null ||
             string.IsNullOrWhiteSpace(initiatorId) ||
@@ -202,7 +200,6 @@ public sealed class TradePhaseCoordinator
             recipientId,
             TradeRequestStatus.AwaitingResponse,
             now,
-            now + RequestResponseTimeout,
             initiatorCardId: null,
             recipientCardId: null);
 
@@ -211,12 +208,10 @@ public sealed class TradePhaseCoordinator
 
     /// <summary>
     /// 接收玩家同意请求，进入双方选牌阶段。
-    /// 仅目标玩家可以同意；若该请求已经超过五秒，则先按超时处理并返回 false。
+    /// 仅目标玩家可以同意；请求会一直等待，直到接收者明确同意或拒绝。
     /// </summary>
-    public bool AcceptRequest(string recipientId, DateTimeOffset now)
+    public bool AcceptRequest(string recipientId)
     {
-        ExpireRequestIfNeeded(now);
-
         if (PendingRequest is null ||
             PendingRequest.Status != TradeRequestStatus.AwaitingResponse ||
             !string.Equals(PendingRequest.RecipientId, recipientId, StringComparison.Ordinal))
@@ -231,10 +226,8 @@ public sealed class TradePhaseCoordinator
     /// <summary>
     /// 接收玩家拒绝请求。拒绝不会消耗发起者机会，因此发起者可以重新邀请。
     /// </summary>
-    public bool DeclineRequest(string recipientId, DateTimeOffset now)
+    public bool DeclineRequest(string recipientId)
     {
-        ExpireRequestIfNeeded(now);
-
         if (PendingRequest is null ||
             PendingRequest.Status != TradeRequestStatus.AwaitingResponse ||
             !string.Equals(PendingRequest.RecipientId, recipientId, StringComparison.Ordinal))
@@ -285,7 +278,6 @@ public sealed class TradePhaseCoordinator
             current.RecipientId,
             TradeRequestStatus.SelectingCards,
             current.CreatedAt,
-            current.ResponseDeadline,
             initiatorCardId,
             recipientCardId);
 
@@ -359,23 +351,6 @@ public sealed class TradePhaseCoordinator
         return true;
     }
 
-    /// <summary>
-    /// 根据当前时间清理超过五秒尚未回应的邀请。
-    /// 后续 UI 应设置五秒计时器，在到期时调用此方法；联机时应由权威端广播超时结果。
-    /// </summary>
-    public bool ExpireRequestIfNeeded(DateTimeOffset now)
-    {
-        if (PendingRequest is null ||
-            PendingRequest.Status != TradeRequestStatus.AwaitingResponse ||
-            now < PendingRequest.ResponseDeadline)
-        {
-            return false;
-        }
-
-        ResolvePendingRequest(TradeRequestStatus.TimedOut);
-        return true;
-    }
-
     /// <summary>查询指定玩家是否仍可主动发起交换。</summary>
     public bool CanInitiate(string playerId) =>
         Status == TradePhaseStatus.InProgress &&
@@ -409,7 +384,6 @@ public sealed class TradePhaseCoordinator
             request.RecipientId,
             status,
             request.CreatedAt,
-            request.ResponseDeadline,
             request.InitiatorCardId,
             request.RecipientCardId);
 
