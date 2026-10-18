@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Godot;
 using HarmonyLib;
+using MegaCrit.Sts2.Core.CardSelection;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Context;
 using MegaCrit.Sts2.Core.Entities.Cards;
@@ -13,7 +14,9 @@ using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
 using MegaCrit.Sts2.Core.Nodes;
+using MegaCrit.Sts2.Core.Nodes.Screens.CardSelection;
 using MegaCrit.Sts2.Core.Nodes.Screens.Overlays;
+using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Platform;
 using MegaCrit.Sts2.Core.Runs;
 
@@ -39,6 +42,12 @@ internal static class TradePhaseRuntime
 
     /// <summary>当前显示的交换面板。</summary>
     private static TradeOverlayScreen? _screen;
+
+    /// <summary>当前由游戏原生卡牌网格显示的选牌界面。</summary>
+    private static NDeckCardSelectScreen? _cardSelectionScreen;
+
+    /// <summary>标识当前本地选牌任务，避免重复刷新时重复打开多个卡牌界面。</summary>
+    private static string? _activeCardSelectionKey;
 
     /// <summary>收到阶段结束消息但本地卡牌移动尚未完成时，暂存结束信号。</summary>
     private static bool _phaseEndReceived;
@@ -423,17 +432,6 @@ internal static class TradePhaseRuntime
         _screen.SkipSelected += () => SubmitIntent(new TradeIntentMessage(
             TradeIntentKind.Skip,
             LocalContext.NetId ?? 0));
-        _screen.CardSelected += cardId =>
-        {
-            if (int.TryParse(cardId, out int cardIndex))
-            {
-                SubmitIntent(new TradeIntentMessage(
-                    TradeIntentKind.SelectCard,
-                    LocalContext.NetId ?? 0,
-                    deckCardIndex: cardIndex));
-            }
-        };
-
         RefreshScreen();
     }
 
@@ -538,8 +536,23 @@ internal static class TradePhaseRuntime
     /// <summary>仅主持端启动五秒计时，到期后广播超时状态。</summary>
     private static void StartHostRequestTimeout(TradeRequestSnapshot? request)
     {
-        if (request is null || RunManager.Instance.NetService.Type != NetGameType.Host || NRun.Instance is null)
+        if (request is null || RunManager.Instance.NetService.Type != NetGameType.Host)
         {
+            return;
+        }
+
+        // 计时器必须挂在当前游戏场景树上。幕间覆盖层已经打开时优先使用它所属的场景树，
+        // 再回退到覆盖层栈，避免 NRun 在奖励弹窗或幕切换过程中暂不可用而导致超时不启动。
+        SceneTree? sceneTree = null;
+        if (_screen is not null && GodotObject.IsInstanceValid(_screen))
+        {
+            sceneTree = _screen.GetTree();
+        }
+
+        sceneTree ??= NOverlayStack.Instance?.GetTree();
+        if (sceneTree is null)
+        {
+            MainFile.Logger.Error("无法取得游戏场景树，交换请求的主持端超时计时器未能启动。");
             return;
         }
 
@@ -547,7 +560,7 @@ internal static class TradePhaseRuntime
         string recipientId = request.RecipientId;
         long deadlineTicks = request.ResponseDeadline.UtcTicks;
         double secondsRemaining = Math.Max(0, (request.ResponseDeadline - DateTimeOffset.UtcNow).TotalSeconds);
-        SceneTreeTimer timer = NRun.Instance.GetTree().CreateTimer(secondsRemaining);
+        SceneTreeTimer timer = sceneTree.CreateTimer(secondsRemaining);
         timer.Timeout += () =>
         {
             TradeRequestSnapshot? pending = Coordinator.PendingRequest;
@@ -583,8 +596,15 @@ internal static class TradePhaseRuntime
         string localKey = PlayerKey(localNetId);
         TradeRequestSnapshot? pending = Coordinator.PendingRequest;
 
+        // 跳过人数来自主持端权威状态；每次状态广播后刷新，使所有玩家都看到相同的全局进度。
+        _screen.SetSkipCount(Coordinator.SkippedPlayerCount, Coordinator.PlayerCount);
+
         if (pending is null)
         {
+            // 本笔交易结束或撤销后清掉选牌标记，允许之后重试或开始下一笔交易。
+            _activeCardSelectionKey = null;
+            _cardSelectionScreen = null;
+
             var players = _runState.Players
                 .Where(player => player.NetId != localNetId)
                 .Select(player => (
@@ -601,13 +621,29 @@ internal static class TradePhaseRuntime
             return;
         }
 
-        if (pending.Status == TradeRequestStatus.AwaitingResponse && pending.RecipientId == localKey)
+        if (pending.Status == TradeRequestStatus.AwaitingResponse)
         {
-            int seconds = (int)Math.Ceiling(Math.Max(0, (pending.ResponseDeadline - DateTimeOffset.UtcNow).TotalSeconds));
-            string initiatorName = PlatformUtil.GetPlayerNameRaw(
-                RunManager.Instance.NetService.Platform,
-                ParsePlayerKey(pending.InitiatorId));
-            _screen.ShowIncomingRequest(initiatorName, seconds);
+            double secondsRemaining = Math.Max(0, (pending.ResponseDeadline - DateTimeOffset.UtcNow).TotalSeconds);
+            if (pending.RecipientId == localKey)
+            {
+                string initiatorName = PlatformUtil.GetPlayerNameRaw(
+                    RunManager.Instance.NetService.Platform,
+                    ParsePlayerKey(pending.InitiatorId));
+                _screen.ShowIncomingRequest(initiatorName, secondsRemaining);
+            }
+            else if (pending.InitiatorId == localKey)
+            {
+                string recipientName = PlatformUtil.GetPlayerNameRaw(
+                    RunManager.Instance.NetService.Platform,
+                    ParsePlayerKey(pending.RecipientId));
+                _screen.ShowOutgoingRequest(recipientName, secondsRemaining);
+            }
+            else
+            {
+                _screen.ShowPlayers(Array.Empty<(string PlayerId, string DisplayName, bool CanRequest)>());
+                _screen.SetStatus("正在等待玩家回应交换请求……");
+            }
+
             return;
         }
 
@@ -619,19 +655,18 @@ internal static class TradePhaseRuntime
                 return;
             }
 
-            _screen.ShowCards(localPlayer.Deck.Cards
-                .Select((card, index) => (Card: card, Index: index))
-                .Where(entry => entry.Card.Type != CardType.Curse)
-                .Select(entry => (
-                    CardId: entry.Index.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    DisplayName: $"{entry.Card.Id.Entry}{(entry.Card.IsUpgraded ? " +" : string.Empty)}")));
-
             bool alreadySelected = pending.InitiatorId == localKey
                 ? pending.InitiatorCardId is not null
                 : pending.RecipientCardId is not null;
             if (alreadySelected)
             {
+                _screen.ShowCardSelectionWaiting("你已确认卡牌，正在等待另一位玩家完成选择。");
                 _screen.SetStatus("已提交选择，等待另一位玩家确认卡牌。");
+            }
+            else
+            {
+                _screen.ShowCardSelectionWaiting("请在游戏卡牌界面中选择一张非诅咒牌并确认。");
+                OpenNativeCardSelection(pending, localPlayer);
             }
 
             return;
@@ -639,6 +674,133 @@ internal static class TradePhaseRuntime
 
         _screen.ShowPlayers(Array.Empty<(string PlayerId, string DisplayName, bool CanRequest)>());
         _screen.SetStatus("正在等待其他玩家完成这笔交易……");
+    }
+
+    /// <summary>
+    /// 使用游戏自己的牌组卡牌选择界面呈现真实卡图、费用、名称与升级状态。
+    /// 选牌仍只是本地操作；确认后把牌组位置发给主持端，由主持端再次验证。
+    /// </summary>
+    private static void OpenNativeCardSelection(TradeRequestSnapshot pending, Player localPlayer)
+    {
+        string selectionKey = string.Join("|",
+            Coordinator.ActNumber,
+            pending.InitiatorId,
+            pending.RecipientId,
+            pending.CreatedAt.UtcTicks);
+
+        // 刷新界面时若当前请求已经有一个正在等待用户操作的原生选牌弹窗，就不再重复创建。
+        if (_activeCardSelectionKey == selectionKey)
+        {
+            return;
+        }
+
+        _activeCardSelectionKey = selectionKey;
+        TaskHelper.RunSafely(OpenNativeCardSelectionAsync(selectionKey, localPlayer, pending));
+    }
+
+    /// <summary>创建并等待游戏原生选牌界面；确认后将所选卡牌换算为牌组索引并提交给主持端。</summary>
+    private static async Task OpenNativeCardSelectionAsync(
+        string selectionKey,
+        Player localPlayer,
+        TradeRequestSnapshot pending)
+    {
+        try
+        {
+            NOverlayStack? overlayStack = NOverlayStack.Instance;
+            if (overlayStack is null)
+            {
+                throw new InvalidOperationException("游戏当前没有可用的覆盖层栈，无法显示卡牌选择界面。");
+            }
+
+            // 只把本机玩家牌组中的非诅咒牌交给游戏网格；原始 CardModel 会用于最终选择与交换。
+            List<CardModel> selectableCards = localPlayer.Deck.Cards
+                .Where(card => card.Type != CardType.Curse)
+                .ToList();
+            if (selectableCards.Count == 0)
+            {
+                throw new InvalidOperationException("牌组中没有可交换的非诅咒牌。");
+            }
+
+            // 复用游戏自带的牌组选择界面，它会负责卡牌网格、滚动、放大预览和确认按钮。
+            // 这里先借用一个原生提示键，再在界面创建后把提示文字换成交换专用说明。
+            var preferences = new CardSelectorPrefs(CardSelectorPrefs.RemoveSelectionPrompt, 1, 1)
+            {
+                RequireManualConfirmation = true,
+                Cancelable = false
+            };
+            NDeckCardSelectScreen selectionScreen = NDeckCardSelectScreen.Create(selectableCards, preferences);
+            _cardSelectionScreen = selectionScreen;
+            overlayStack.Push(selectionScreen);
+
+            // 原生屏幕的提示控件为私有字段；仅覆盖其显示文字，不改变原生卡牌网格和确认逻辑。
+            // 延后一帧覆盖提示，确保原生屏幕已完成 _Ready，不会再被初始化逻辑改回默认文案。
+            Callable.From(() =>
+            {
+                if (!GodotObject.IsInstanceValid(selectionScreen))
+                {
+                    return;
+                }
+
+                var promptLabel = AccessTools.Field(typeof(NDeckCardSelectScreen), "_infoLabel")
+                    ?.GetValue(selectionScreen) as RichTextLabel;
+                if (promptLabel is not null)
+                {
+                    promptLabel.Text = "请选择一张要与对方交换的卡牌";
+                }
+            }).CallDeferred();
+
+            IEnumerable<CardModel> selectedCards = await selectionScreen.CardsSelected();
+            CardModel? selectedCard = selectedCards.FirstOrDefault();
+            if (selectedCard is null)
+            {
+                throw new InvalidOperationException("原生选牌界面未返回已确认的卡牌。");
+            }
+
+            // 用对象引用定位仍在原牌组中的那张牌，避免依赖卡牌名称（同一牌组里可能有多张同名牌）。
+            int deckCardIndex = -1;
+            for (int index = 0; index < localPlayer.Deck.Cards.Count; index++)
+            {
+                if (ReferenceEquals(localPlayer.Deck.Cards[index], selectedCard))
+                {
+                    deckCardIndex = index;
+                    break;
+                }
+            }
+            if (deckCardIndex < 0 || selectedCard.Type == CardType.Curse)
+            {
+                throw new InvalidOperationException("确认的卡牌已不在本机牌组中，或该卡牌为诅咒牌。");
+            }
+
+            // 只有当原请求仍处于选牌阶段时才发送，避免弹窗返回较晚时把旧选择套到新交易上。
+            TradeRequestSnapshot? current = Coordinator.PendingRequest;
+            if (current is null ||
+                current.CreatedAt.UtcTicks != pending.CreatedAt.UtcTicks ||
+                current.Status != TradeRequestStatus.SelectingCards)
+            {
+                return;
+            }
+
+            SubmitIntent(new TradeIntentMessage(
+                TradeIntentKind.SelectCard,
+                LocalContext.NetId ?? 0,
+                deckCardIndex: deckCardIndex));
+        }
+        catch (Exception exception)
+        {
+            MainFile.Logger.Error($"打开或完成原生卡牌选择界面失败：{exception}");
+            if (_activeCardSelectionKey == selectionKey)
+            {
+                // 保留错误状态而不自动重复弹窗，避免在游戏 UI 异常时形成无限弹窗循环。
+                _screen?.ShowCardSelectionWaiting("卡牌界面打开失败，请查看游戏日志并重新尝试。");
+            }
+        }
+        finally
+        {
+            if (_activeCardSelectionKey == selectionKey)
+            {
+                _cardSelectionScreen = null;
+            }
+        }
     }
 
     /// <summary>在主持端检查交换阶段是否已满足结束条件。</summary>

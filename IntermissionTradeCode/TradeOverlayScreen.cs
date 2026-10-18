@@ -8,11 +8,11 @@ using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 namespace IntermissionTrade.IntermissionTradeCode;
 
 /// <summary>
-/// 幕间卡牌交换面板的第一版界面骨架。
+/// 幕间卡牌交换的请求与阶段状态界面。
 ///
 /// 该面板使用游戏现有的 NOverlayStack 管理，因而能作为模态覆盖层显示在奖励/地图界面之上。
-/// 本类只负责显示状态和把玩家点击转成 C# 事件；它不会自行发送网络消息，也不会修改卡牌。
-/// 之后由交换流程服务订阅这些事件，再通过 BaseLib 消息接口进行联机验证和同步。
+/// 本类只负责显示玩家、请求操作和等待状态；卡牌图形网格由游戏自己的牌组选牌屏幕负责显示。
+/// 本类不会自行发送网络消息，也不会修改卡牌，所有交互都交给交换流程服务审核。
 /// </summary>
 public partial class TradeOverlayScreen : Control, IOverlayScreen
 {
@@ -39,9 +39,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
 
     /// <summary>点击跳过后触发；主动机会如何标记由交换协调器决定。</summary>
     public event Action? SkipSelected;
-
-    /// <summary>玩家选中卡牌并按下确认按钮后触发；参数使用牌组位置，而不是可能重复的显示名称。</summary>
-    public event Action<string>? CardSelected;
 
     /// <summary>
     /// 将交换界面放到游戏自己的覆盖层栈顶部。
@@ -74,6 +71,21 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     /// <summary>状态控件，用于显示请求倒计时、等待对方等信息。</summary>
     private Label? _statusLabel;
 
+    /// <summary>显示请求剩余时间的文字，帮助玩家准确判断回应时限。</summary>
+    private Label? _countdownLabel;
+
+    /// <summary>按请求剩余时间逐渐耗尽的可视化进度条。</summary>
+    private ProgressBar? _requestProgressBar;
+
+    /// <summary>请求倒计时尚余秒数；由 Godot 每帧传入的 delta 递减。</summary>
+    private double _requestSecondsRemaining;
+
+    /// <summary>当前倒计时显示的提示文字，例如“回应剩余”或“等待回应”。</summary>
+    private string _requestCountdownDescription = string.Empty;
+
+    /// <summary>只有正在等待回应的请求才启用本地动画倒计时。</summary>
+    private bool _isRequestCountdownActive;
+
     /// <summary>显示玩家按钮或卡牌按钮的列表容器。</summary>
     private VBoxContainer? _itemsContainer;
 
@@ -86,12 +98,6 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     /// <summary>结束自己的主动操作的跳过按钮。</summary>
     private Button? _skipButton;
 
-    /// <summary>卡牌选择步骤中用于确认已选卡牌的按钮。</summary>
-    private Button? _confirmCardButton;
-
-    /// <summary>本地暂存当前高亮的卡牌标识；只有点击确认后才发送给主持端。</summary>
-    private string? _selectedCardId;
-
     /// <summary>允许该节点挂入游戏覆盖层栈时安全创建界面控件。</summary>
     public override void _Ready()
     {
@@ -100,7 +106,7 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
 
     /// <summary>
     /// 创建由 Godot 原生控件组成的交换面板。
-    /// 先用清晰、简单的文字按钮验证交互流程，卡牌图像和美术排版可在功能稳定后再完善。
+    /// 玩家请求对象使用按钮列表；卡牌选取会切换到游戏自带的卡图网格界面。
     /// </summary>
     private void BuildInterface()
     {
@@ -164,6 +170,29 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         _statusLabel.AddThemeFontSizeOverride("font_size", 18);
         layout.AddChild(_statusLabel);
 
+        // 将文字倒计时和进度条放在玩家列表之前，使请求时限在弹窗中醒目可见。
+        _countdownLabel = new Label
+        {
+            Text = string.Empty,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Visible = false
+        };
+        _countdownLabel.AddThemeFontSizeOverride("font_size", 16);
+        layout.AddChild(_countdownLabel);
+
+        // 进度条初始为满格；请求经过五秒后逐渐归零，与主持端超时判定同步。
+        _requestProgressBar = new ProgressBar
+        {
+            MinValue = 0,
+            MaxValue = 100,
+            Value = 100,
+            ShowPercentage = false,
+            CustomMinimumSize = new Vector2(0, 14),
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            Visible = false
+        };
+        layout.AddChild(_requestProgressBar);
+
         var scroll = new ScrollContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
@@ -194,25 +223,13 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         _declineButton.Pressed += () => RequestDeclined?.Invoke();
         responseButtons.AddChild(_declineButton);
 
-        // 玩家先点卡牌进行本地选择，再点“确认卡牌”提交；避免误触直接完成确认。
-        _confirmCardButton = new Button { Text = "确认卡牌", Visible = false, Disabled = true };
-        _confirmCardButton.Pressed += () =>
-        {
-            if (_selectedCardId is not null)
-            {
-                CardSelected?.Invoke(_selectedCardId);
-                _confirmCardButton.Disabled = true;
-            }
-        };
-        responseButtons.AddChild(_confirmCardButton);
-
         var bottomButtons = new HBoxContainer
         {
             Alignment = BoxContainer.AlignmentMode.End
         };
         layout.AddChild(bottomButtons);
 
-        _skipButton = new Button { Text = "跳过" };
+        _skipButton = new Button { Text = "跳过 0/0" };
         _skipButton.Pressed += () => SkipSelected?.Invoke();
         bottomButtons.AddChild(_skipButton);
     }
@@ -224,10 +241,9 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     public void ShowPlayers(IEnumerable<(string PlayerId, string DisplayName, bool CanRequest)> players)
     {
         ClearItems();
-        _selectedCardId = null;
+        StopRequestCountdown();
         SetHeader("选择交换对象", "点击玩家昵称发送交换请求；请求五秒内未获回应会自动撤销。");
         SetResponseButtonsVisible(false);
-        SetCardConfirmationVisible(false);
 
         foreach ((string playerId, string displayName, bool canRequest) in players)
         {
@@ -243,42 +259,65 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     }
 
     /// <summary>显示一条发给当前玩家的请求，并展示同意/拒绝按钮。</summary>
-    public void ShowIncomingRequest(string initiatorName, int secondsRemaining)
+    public void ShowIncomingRequest(string initiatorName, double secondsRemaining)
     {
         ClearItems();
-        _selectedCardId = null;
-        SetHeader("收到交换请求", $"{initiatorName} 想与你交换一张卡牌。请在 {Math.Max(0, secondsRemaining)} 秒内回应。");
+        SetHeader("收到交换请求", $"{initiatorName} 想与你交换一张卡牌，请在倒计时结束前回应。");
+        StartRequestCountdown(secondsRemaining, "回应剩余");
         SetResponseButtonsVisible(true);
-        SetCardConfirmationVisible(false);
     }
 
-    /// <summary>显示当前可选择的卡牌列表；诅咒牌应由调用方提前过滤，不在界面中展示。</summary>
-    public void ShowCards(IEnumerable<(string CardId, string DisplayName)> cards)
+    /// <summary>让发起者也能看到对方回应请求的剩余时间和进度。</summary>
+    public void ShowOutgoingRequest(string recipientName, double secondsRemaining)
     {
         ClearItems();
-        _selectedCardId = null;
-        SetHeader("选择一张卡牌", "从自己的整副牌组中选择一张非诅咒牌，然后确认。");
+        SetHeader("等待玩家回应", $"已向 {recipientName} 发送交换请求；对方未及时回应时请求会自动撤销。");
+        StartRequestCountdown(secondsRemaining, "等待回应");
         SetResponseButtonsVisible(false);
-        SetCardConfirmationVisible(true);
+    }
 
-        foreach ((string cardId, string displayName) in cards)
+    /// <summary>提示玩家游戏原生的图形卡牌选择界面将打开。</summary>
+    public void ShowCardSelectionWaiting(string message)
+    {
+        ClearItems();
+        StopRequestCountdown();
+        SetHeader("选择一张卡牌", message);
+        SetResponseButtonsVisible(false);
+    }
+
+    /// <summary>刷新跳过按钮上的全局计数，显示已跳过人数与本局总人数。</summary>
+    public void SetSkipCount(int skippedPlayers, int totalPlayers)
+    {
+        if (_skipButton is null)
         {
-            var button = new Button
-            {
-                Text = displayName,
-                CustomMinimumSize = new Vector2(0, 48)
-            };
-            button.Pressed += () =>
-            {
-                _selectedCardId = cardId;
-                if (_confirmCardButton is not null)
-                {
-                    _confirmCardButton.Disabled = false;
-                }
+            return;
+        }
 
-                SetStatus($"已选择 {displayName}，点击“确认卡牌”提交给对方。");
-            };
-            _itemsContainer?.AddChild(button);
+        // 防止异常网络状态产生负数或“已跳过人数大于总人数”的显示。
+        int safeTotal = Math.Max(0, totalPlayers);
+        int safeSkipped = Math.Clamp(skippedPlayers, 0, safeTotal);
+        _skipButton.Text = $"跳过 {safeSkipped}/{safeTotal}";
+    }
+
+    /// <summary>每帧更新本地显示；真正的超时裁决仍由主持端统一完成并广播。</summary>
+    public override void _Process(double delta)
+    {
+        if (!_isRequestCountdownActive || _countdownLabel is null || _requestProgressBar is null)
+        {
+            return;
+        }
+
+        // delta 是 Godot 当前帧经过的秒数；用它而非帧数递减，保证不同帧率下倒计时速度一致。
+        _requestSecondsRemaining = Math.Max(0, _requestSecondsRemaining - delta);
+        _requestProgressBar.Value = _requestSecondsRemaining / TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds * 100.0;
+        _countdownLabel.Text = _requestSecondsRemaining > 0
+            ? $"{_requestCountdownDescription}：{_requestSecondsRemaining:0.0} 秒"
+            : "请求已到期，正在同步撤销……";
+
+        // 本地动画到零后停止更新，但保留零格进度和到期提示，直到主持端状态消息到达。
+        if (_requestSecondsRemaining <= 0)
+        {
+            _isRequestCountdownActive = false;
         }
     }
 
@@ -323,17 +362,46 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         }
     }
 
-    /// <summary>只在选牌步骤显示确认按钮，并在没有选中卡牌时禁用它。</summary>
-    private void SetCardConfirmationVisible(bool visible)
+    /// <summary>启动请求倒计时显示，并按剩余时间初始化进度条。</summary>
+    private void StartRequestCountdown(double secondsRemaining, string description)
     {
-        if (_confirmCardButton is not null)
+        _requestSecondsRemaining = Math.Clamp(
+            secondsRemaining,
+            0,
+            TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds);
+        _requestCountdownDescription = description;
+        _isRequestCountdownActive = _requestSecondsRemaining > 0;
+
+        if (_countdownLabel is not null)
         {
-            _confirmCardButton.Visible = visible;
-            _confirmCardButton.Disabled = !visible || _selectedCardId is null;
+            _countdownLabel.Visible = true;
+            _countdownLabel.Text = $"{_requestCountdownDescription}：{_requestSecondsRemaining:0.0} 秒";
+        }
+
+        if (_requestProgressBar is not null)
+        {
+            _requestProgressBar.Visible = true;
+            _requestProgressBar.Value = _requestSecondsRemaining /
+                TradePhaseCoordinator.RequestResponseTimeout.TotalSeconds * 100.0;
         }
     }
 
-    /// <summary>重画玩家列表或卡牌列表前移除上一阶段留下的按钮。</summary>
+    /// <summary>离开请求等待界面时隐藏并停止倒计时，避免旧请求时间残留到其他步骤。</summary>
+    private void StopRequestCountdown()
+    {
+        _isRequestCountdownActive = false;
+        if (_countdownLabel is not null)
+        {
+            _countdownLabel.Visible = false;
+        }
+
+        if (_requestProgressBar is not null)
+        {
+            _requestProgressBar.Visible = false;
+        }
+    }
+
+    /// <summary>重画可交换玩家列表前移除上一阶段留下的按钮。</summary>
     private void ClearItems()
     {
         if (_itemsContainer is null)

@@ -17,6 +17,12 @@
 
 - 新增或修改的代码必须附有详细中文注释，解释代码用途和关键逻辑。
 
+## 最近一次实现调整
+
+- 请求接收方和发起方都能看到剩余秒数及五秒进度条；进度条由界面帧更新，真正的超时仍由主持端计时器裁决并广播。
+- 主持端计时器优先从当前交换覆盖层获取 Godot 场景树，并回退到覆盖层栈；若场景树不可用会写入错误日志，不会静默跳过计时。
+- 跳过按钮显示“跳过 已跳过人数/全体玩家人数”，例如“跳过 2/3”。该人数由协调器的跳过集合计算，成功发起交换的玩家不会计为跳过。
+
 ## 当前进度
 
 - 已用 `Alchyr.Sts2.Templates` 的空白 mod 模板生成 `IntermissionTrade` 项目。
@@ -24,7 +30,8 @@
 - 用户确认此前本机生成成功。构建输出显示 DLL、PDB、JSON 已复制到游戏 mods 目录。
 - 交换流程接入已开始，但尚未确认 mod 在游戏中实际加载或进行联机测试；当前代码不能视作已验证可玩的成品。
 - 已新增 `IntermissionTradeCode/TradePhaseCoordinator.cs`：实现纯 C# 交换阶段状态协调器，覆盖仅第一/二幕、每个阶段主动成功机会重置、拒绝/5 秒未回应可重试、双方选牌确认、单笔请求串行化和跳过语义。跳过暂定为放弃主动发起但仍可接收请求。
-- `IntermissionTradeCode/TradeOverlayScreen.cs`：通过游戏 `NOverlayStack` 打开覆盖层，现已包含玩家列表、同意/拒绝、跳过，以及“先选卡、再按确认卡牌”的界面步骤。
+- `IntermissionTradeCode/TradeOverlayScreen.cs`：通过游戏 `NOverlayStack` 打开交换阶段覆盖层，包含玩家列表、同意/拒绝和跳过。
+- 选牌时由 `TradePhaseRuntime` 打开游戏原生 `NDeckCardSelectScreen`，使用牌面图像网格、滚动与原生确认操作；选择完成后将 `CardModel` 映射回本机牌组位置再交主持端验证。
 - `IntermissionTradeCode/TradeNetworkMessages.cs`：定义玩家意图和主持端权威状态的可靠消息；意图只发给主持端，主持端广播审核后的状态。
 - `IntermissionTradeCode/TradePhaseRuntime.cs`：已开始接入 `ActChangeSynchronizer.MoveToNextAct` 幕间拦截、主持端流程校验、请求超时、界面事件、玩家昵称读取和双方牌组的 `CardPileCmd.GiveToAnotherPlayer` 转移。
 - `MainFile.Initialize` 会订阅消息路由并安装 Harmony 补丁。客户端会等待主持端的阶段及结果广播，再在本地应用相同卡牌迁移。

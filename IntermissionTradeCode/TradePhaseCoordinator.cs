@@ -108,6 +108,12 @@ public sealed class TradePhaseCoordinator
     /// <summary>当前阶段总状态。</summary>
     public TradePhaseStatus Status { get; private set; } = TradePhaseStatus.NotStarted;
 
+    /// <summary>本阶段参加交换的玩家总数，用于在界面上显示跳过进度。</summary>
+    public int PlayerCount => _playerIds.Count;
+
+    /// <summary>本阶段已明确点击跳过的玩家数；成功交换的玩家不计入该数字。</summary>
+    public int SkippedPlayerCount => _playersWhoSkipped.Count;
+
     /// <summary>当前尚未终结的唯一一笔请求；阶段采用串行交易以避免同一玩家同时选多张牌。</summary>
     public TradeRequestSnapshot? PendingRequest { get; private set; }
 
