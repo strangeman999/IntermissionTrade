@@ -17,6 +17,9 @@ public partial class MainFile : Node
     {
         var assembly = Assembly.GetExecutingAssembly();
 
+        // 先订阅 BaseLib 的交换消息路由，再安装幕末切幕补丁，避免开始阶段后才注册而漏掉首条网络消息。
+        TradePhaseRuntime.Initialize();
+
         //If you want to use scripts defined in your mod for Godot scenes, uncomment the following line.
         //Godot.Bridge.ScriptManagerBridge.LookupScriptsInAssembly(assembly);
      

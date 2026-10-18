@@ -40,8 +40,33 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     /// <summary>点击跳过后触发；主动机会如何标记由交换协调器决定。</summary>
     public event Action? SkipSelected;
 
-    /// <summary>点击某张卡牌后触发；参数使用稳定卡牌标识，而不是显示名称。</summary>
+    /// <summary>玩家选中卡牌并按下确认按钮后触发；参数使用牌组位置，而不是可能重复的显示名称。</summary>
     public event Action<string>? CardSelected;
+
+    /// <summary>
+    /// 将交换界面放到游戏自己的覆盖层栈顶部。
+    /// 使用游戏提供的 NOverlayStack.Push 而不是直接挂到场景根节点，
+    /// 这样游戏会正确处理模态遮罩、鼠标输入和当前活动屏幕上下文。
+    /// </summary>
+    public static TradeOverlayScreen? Open()
+    {
+        NOverlayStack? overlayStack = NOverlayStack.Instance;
+        if (overlayStack is null)
+        {
+            // 例如游戏尚未进入实际跑图场景时，覆盖层栈还不存在；此时不能创建孤立界面。
+            return null;
+        }
+
+        if (overlayStack.Peek() is TradeOverlayScreen alreadyOpen)
+        {
+            // 避免多个网络回调重复打开同一个流程的面板。
+            return alreadyOpen;
+        }
+
+        var screen = new TradeOverlayScreen();
+        overlayStack.Push(screen);
+        return screen;
+    }
 
     /// <summary>标题控件，用于在不同交换步骤间提示当前操作。</summary>
     private Label? _titleLabel;
@@ -60,6 +85,12 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
 
     /// <summary>结束自己的主动操作的跳过按钮。</summary>
     private Button? _skipButton;
+
+    /// <summary>卡牌选择步骤中用于确认已选卡牌的按钮。</summary>
+    private Button? _confirmCardButton;
+
+    /// <summary>本地暂存当前高亮的卡牌标识；只有点击确认后才发送给主持端。</summary>
+    private string? _selectedCardId;
 
     /// <summary>允许该节点挂入游戏覆盖层栈时安全创建界面控件。</summary>
     public override void _Ready()
@@ -163,6 +194,18 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         _declineButton.Pressed += () => RequestDeclined?.Invoke();
         responseButtons.AddChild(_declineButton);
 
+        // 玩家先点卡牌进行本地选择，再点“确认卡牌”提交；避免误触直接完成确认。
+        _confirmCardButton = new Button { Text = "确认卡牌", Visible = false, Disabled = true };
+        _confirmCardButton.Pressed += () =>
+        {
+            if (_selectedCardId is not null)
+            {
+                CardSelected?.Invoke(_selectedCardId);
+                _confirmCardButton.Disabled = true;
+            }
+        };
+        responseButtons.AddChild(_confirmCardButton);
+
         var bottomButtons = new HBoxContainer
         {
             Alignment = BoxContainer.AlignmentMode.End
@@ -181,8 +224,10 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     public void ShowPlayers(IEnumerable<(string PlayerId, string DisplayName, bool CanRequest)> players)
     {
         ClearItems();
+        _selectedCardId = null;
         SetHeader("选择交换对象", "点击玩家昵称发送交换请求；请求五秒内未获回应会自动撤销。");
         SetResponseButtonsVisible(false);
+        SetCardConfirmationVisible(false);
 
         foreach ((string playerId, string displayName, bool canRequest) in players)
         {
@@ -201,16 +246,20 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
     public void ShowIncomingRequest(string initiatorName, int secondsRemaining)
     {
         ClearItems();
+        _selectedCardId = null;
         SetHeader("收到交换请求", $"{initiatorName} 想与你交换一张卡牌。请在 {Math.Max(0, secondsRemaining)} 秒内回应。");
         SetResponseButtonsVisible(true);
+        SetCardConfirmationVisible(false);
     }
 
     /// <summary>显示当前可选择的卡牌列表；诅咒牌应由调用方提前过滤，不在界面中展示。</summary>
     public void ShowCards(IEnumerable<(string CardId, string DisplayName)> cards)
     {
         ClearItems();
+        _selectedCardId = null;
         SetHeader("选择一张卡牌", "从自己的整副牌组中选择一张非诅咒牌，然后确认。");
         SetResponseButtonsVisible(false);
+        SetCardConfirmationVisible(true);
 
         foreach ((string cardId, string displayName) in cards)
         {
@@ -219,7 +268,16 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
                 Text = displayName,
                 CustomMinimumSize = new Vector2(0, 48)
             };
-            button.Pressed += () => CardSelected?.Invoke(cardId);
+            button.Pressed += () =>
+            {
+                _selectedCardId = cardId;
+                if (_confirmCardButton is not null)
+                {
+                    _confirmCardButton.Disabled = false;
+                }
+
+                SetStatus($"已选择 {displayName}，点击“确认卡牌”提交给对方。");
+            };
             _itemsContainer?.AddChild(button);
         }
     }
@@ -262,6 +320,16 @@ public partial class TradeOverlayScreen : Control, IOverlayScreen
         if (_declineButton is not null)
         {
             _declineButton.Visible = visible;
+        }
+    }
+
+    /// <summary>只在选牌步骤显示确认按钮，并在没有选中卡牌时禁用它。</summary>
+    private void SetCardConfirmationVisible(bool visible)
+    {
+        if (_confirmCardButton is not null)
+        {
+            _confirmCardButton.Visible = visible;
+            _confirmCardButton.Disabled = !visible || _selectedCardId is null;
         }
     }
 

@@ -37,7 +37,10 @@ public enum TradeRequestStatus
     Declined,
 
     /// <summary>请求超过五秒仍未得到回应，已自动撤销。</summary>
-    TimedOut
+    TimedOut,
+
+    /// <summary>实际转移卡牌失败，撤销本笔交易且不消耗发起者机会。</summary>
+    Failed
 }
 
 /// <summary>
@@ -107,6 +110,9 @@ public sealed class TradePhaseCoordinator
 
     /// <summary>当前尚未终结的唯一一笔请求；阶段采用串行交易以避免同一玩家同时选多张牌。</summary>
     public TradeRequestSnapshot? PendingRequest { get; private set; }
+
+    /// <summary>供界面和调用方快速判断当前是否有等待处理的请求或选牌交易。</summary>
+    public bool HasPendingRequest => PendingRequest is not null;
 
     /// <summary>本幕参与交换的玩家标识，按开始阶段时的名单固定。</summary>
     private readonly HashSet<string> _playerIds = new(StringComparer.Ordinal);
@@ -235,12 +241,12 @@ public sealed class TradePhaseCoordinator
     }
 
     /// <summary>
-    /// 任一方提交已选卡牌。每位玩家只能确认自己的选择，且两边的卡牌标识不能相同。
+    /// 任一方提交已选卡牌。每位玩家只能确认自己的选择；不同玩家牌组中相同位置代表不同卡牌，因此索引可以相同。
     /// 本类不判断卡牌是否为诅咒或仍属于该玩家；提交真实交换前必须由游戏侧校验这些条件。
     /// </summary>
     /// <param name="playerId">提交选择的玩家标识。</param>
     /// <param name="cardId">所选卡牌在本局中的稳定唯一标识。</param>
-    /// <returns>双方都确认时返回 true；仅当前一方确认或提交无效时返回 false。</returns>
+    /// <returns>双方都确认时返回 true，表示已准备好提交；仅当前一方确认时返回 false。</returns>
     public bool ConfirmCard(string playerId, string cardId)
     {
         if (Status != TradePhaseStatus.InProgress ||
@@ -268,14 +274,6 @@ public sealed class TradePhaseCoordinator
             return false;
         }
 
-        // 一张卡不能同时作为交换双方的选择；UI 更换选择时可再次提交新卡牌标识。
-        if (initiatorCardId is not null &&
-            recipientCardId is not null &&
-            string.Equals(initiatorCardId, recipientCardId, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
         PendingRequest = new TradeRequestSnapshot(
             current.InitiatorId,
             current.RecipientId,
@@ -290,10 +288,46 @@ public sealed class TradePhaseCoordinator
             return false;
         }
 
-        // 两边选择均已确认才提交完成；发起者机会在此刻消耗，接收者仍保有自己的主动机会。
-        _initiatorsWhoSucceeded.Add(current.InitiatorId);
+        // 两边选择均已确认，但此时还没有执行游戏内卡牌迁移。
+        // 只有游戏命令真正成功后，调用方才能调用 CompleteConfirmedTrade 消耗发起者机会。
+        return true;
+    }
+
+    /// <summary>
+    /// 在游戏侧确认两张卡已成功互换后，将当前交易正式记为成功。
+    /// 分离“双方选择完成”和“游戏模型迁移成功”，避免卡牌转移失败时仍消耗机会。
+    /// </summary>
+    public bool CompleteConfirmedTrade()
+    {
+        if (PendingRequest is null ||
+            PendingRequest.Status != TradeRequestStatus.SelectingCards ||
+            PendingRequest.InitiatorCardId is null ||
+            PendingRequest.RecipientCardId is null)
+        {
+            return false;
+        }
+
+        // 只有成功发起的一方会用掉主动机会；接收者仍可以之后主动发起另一笔交换。
+        _initiatorsWhoSucceeded.Add(PendingRequest.InitiatorId);
         ResolvePendingRequest(TradeRequestStatus.Completed);
         UpdateCompletionStatus();
+        return true;
+    }
+
+    /// <summary>
+    /// 游戏侧卡牌迁移失败时释放当前交易，但不扣除发起者机会，允许玩家重新尝试。
+    /// </summary>
+    public bool FailConfirmedTrade()
+    {
+        if (PendingRequest is null ||
+            PendingRequest.Status != TradeRequestStatus.SelectingCards ||
+            PendingRequest.InitiatorCardId is null ||
+            PendingRequest.RecipientCardId is null)
+        {
+            return false;
+        }
+
+        ResolvePendingRequest(TradeRequestStatus.Failed);
         return true;
     }
 

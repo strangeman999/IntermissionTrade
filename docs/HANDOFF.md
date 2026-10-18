@@ -22,13 +22,18 @@
 - 已用 `Alchyr.Sts2.Templates` 的空白 mod 模板生成 `IntermissionTrade` 项目。
 - 已创建并打开 `IntermissionTrade.sln`。
 - 用户确认此前本机生成成功。构建输出显示 DLL、PDB、JSON 已复制到游戏 mods 目录。
-- 尚未实现可在游戏内运行的交换功能，也没有确认 mod 在游戏中实际加载或进行联机测试。
+- 交换流程接入已开始，但尚未确认 mod 在游戏中实际加载或进行联机测试；当前代码不能视作已验证可玩的成品。
 - 已新增 `IntermissionTradeCode/TradePhaseCoordinator.cs`：实现纯 C# 交换阶段状态协调器，覆盖仅第一/二幕、每个阶段主动成功机会重置、拒绝/5 秒未回应可重试、双方选牌确认、单笔请求串行化和跳过语义。跳过暂定为放弃主动发起但仍可接收请求。
-- 该协调器不持有游戏 `Player`/`CardModel`，也未连接 UI、游戏幕间钩子、网络消息或实际卡牌转移；提交前仍须由游戏侧确认卡牌归属并排除诅咒牌。
-- 添加协调器后已运行 `dotnet build IntermissionTrade.sln --no-restore`，构建成功，0 警告、0 错误，模板将产物复制到 mods 目录。尚未进行游戏内或联机验证。
+- `IntermissionTradeCode/TradeOverlayScreen.cs`：通过游戏 `NOverlayStack` 打开覆盖层，现已包含玩家列表、同意/拒绝、跳过，以及“先选卡、再按确认卡牌”的界面步骤。
+- `IntermissionTradeCode/TradeNetworkMessages.cs`：定义玩家意图和主持端权威状态的可靠消息；意图只发给主持端，主持端广播审核后的状态。
+- `IntermissionTradeCode/TradePhaseRuntime.cs`：已开始接入 `ActChangeSynchronizer.MoveToNextAct` 幕间拦截、主持端流程校验、请求超时、界面事件、玩家昵称读取和双方牌组的 `CardPileCmd.GiveToAnotherPlayer` 转移。
+- `MainFile.Initialize` 会订阅消息路由并安装 Harmony 补丁。客户端会等待主持端的阶段及结果广播，再在本地应用相同卡牌迁移。
+- 卡牌转移前由主持端再次确认卡牌索引有效且不是诅咒牌；移动的是原有 `CardModel`，因此模型的升级状态等数据应随卡移动。运行时断线、异常回滚和消息注册仍需实际联机验证。
+- 已运行 `dotnet build IntermissionTrade.sln --no-restore`，最近一次生成成功，0 警告、0 错误，模板将产物复制到 mods 目录。尚未进行游戏内或联机验证。
 - 游戏安装目录包含 `sts2.xml`，BaseLib NuGet 包版本为 3.4.7；后续应继续用本机文档/程序集核对奖励完成时机、联机安全消息和牌组迁移 API，再实现接入。
-- 用户刚刚报告 Visual Studio 已更新到 **17.14**。更新后的重新构建尚未确认。
-- 当前项目目录尚未初始化为 Git 仓库，也未配置远程仓库或 CI。
+- Git 本地仓库已初始化；规则协调器基线提交为 `d11644d`，界面骨架提交为 `c5ce81f`。网络协议和运行时接入仍在工作区，未提交。
+- 用户报告 Visual Studio 已更新到 **17.14**；本轮重新构建成功，0 警告、0 错误。
+- 尚未配置 Git 远程仓库或 CI。
 
 ## 环境与路径
 
@@ -52,7 +57,7 @@
 
 1. 在 VS 17.14 中重新生成解决方案，确认更新后的工具链仍可构建。
 2. 启动游戏，在模组设置中确认 `IntermissionTrade` 和 BaseLib 均可加载；遇到问题查看 `godot.log`。
-3. 继续梳理“奖励全部选完”的游戏生命周期入口，以及联机玩家如何安全地提交/同步卡牌选择。
-4. 接入 UI、游戏钩子、联机流程和卡牌转移；跳过语义等未确认处按 `docs/GAMEPLAY_SPEC.md` 中的暂定方案实现，并明确告知用户。
-5. 建立 Git 本地仓库并提交当前可构建基线；之后再评估 CI。项目构建依赖本机游戏程序集，因此公共 CI runner 可能无法直接构建。不要将游戏文件提交到仓库。
+3. 先核对 BaseLib 是否会自动发现并注册两种 `ICustomMessage`，并确认游戏运行时实际调用 `ActChangeSynchronizer.MoveToNextAct` 的时机确实在所有卡牌奖励选完之后。
+4. 检查运行时边界情况：五秒倒计时 UI 刷新、玩家断线、卡牌迁移命令异常、收到旧幕延迟消息和 Overlay 无法打开时的恢复策略。
+5. 完成功能代码后再构建；随后在游戏内验证 mod 加载、单人/多人切幕及双人交换。双人联机测试前不要声称交换功能可用。项目构建依赖本机游戏程序集，因此公共 CI runner 可能无法直接构建。不要将游戏文件提交到仓库。
 
