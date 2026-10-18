@@ -48,6 +48,7 @@
 ## 已知构建行为
 
 - 模板项目的 `.csproj` 在构建后将 `IntermissionTrade.dll`、`IntermissionTrade.pdb` 和 `IntermissionTrade.json` 复制到 mod 部署目录。
+- 当前项目仅包含 C# 代码，没有 Godot 场景或资源包；`IntermissionTrade.json` 中必须设置 `has_pck: false`，否则游戏会因找不到 `.pck` 拒绝加载 mod。添加 Godot 资源后再生成并启用 PCK。
 - 曾看到的编译 DLL 路径为 `.godot\mono\temp\bin\Debug\IntermissionTrade.dll`。
 - C# 代码改动用 **生成 → 生成解决方案**；非代码资源改动需要走模板 Publish 流程。
 - 用户机器上 `Ctrl+Shift+B` 曾弹出 Windows 表情面板；给用户指路时使用 VS 菜单操作。
