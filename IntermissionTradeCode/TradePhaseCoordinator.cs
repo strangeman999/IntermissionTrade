@@ -100,8 +100,8 @@ public sealed class TradePhaseCoordinator
     /// <summary>本阶段参加交换的玩家总数，用于在界面上显示跳过进度。</summary>
     public int PlayerCount => _playerIds.Count;
 
-    /// <summary>本阶段已明确点击跳过的玩家数；成功交换的玩家不计入该数字。</summary>
-    public int SkippedPlayerCount => _playersWhoSkipped.Count;
+    /// <summary>已结束本阶段主动操作的玩家数；包括手动跳过和成功交换后自动跳过的发起者。</summary>
+    public int SkippedPlayerCount => _playersWhoFinishedInitiating.Count;
 
     /// <summary>当前尚未终结的唯一一笔请求；阶段采用串行交易以避免同一玩家同时选多张牌。</summary>
     public TradeRequestSnapshot? PendingRequest { get; private set; }
@@ -115,8 +115,8 @@ public sealed class TradePhaseCoordinator
     /// <summary>已成功主动发起过交换的玩家；接收交换不会写入此集合。</summary>
     private readonly HashSet<string> _initiatorsWhoSucceeded = new(StringComparer.Ordinal);
 
-    /// <summary>已按“跳过”结束自己主动操作的玩家；仍允许他们接收他人请求。</summary>
-    private readonly HashSet<string> _playersWhoSkipped = new(StringComparer.Ordinal);
+    /// <summary>已结束本阶段主动操作的玩家；成功交换的发起者和手动跳过者都在此集合中。</summary>
+    private readonly HashSet<string> _playersWhoFinishedInitiating = new(StringComparer.Ordinal);
 
     /// <summary>最近一笔交易的终态，供界面在关闭请求卡片前呈现结果。</summary>
     public TradeRequestSnapshot? LastResolvedRequest { get; private set; }
@@ -150,7 +150,7 @@ public sealed class TradePhaseCoordinator
         _playerIds.Clear();
         _playerIds.UnionWith(validPlayerIds);
         _initiatorsWhoSucceeded.Clear();
-        _playersWhoSkipped.Clear();
+        _playersWhoFinishedInitiating.Clear();
         PendingRequest = null;
         LastResolvedRequest = null;
         Status = TradePhaseStatus.InProgress;
@@ -164,7 +164,7 @@ public sealed class TradePhaseCoordinator
         Status = TradePhaseStatus.NotStarted;
         _playerIds.Clear();
         _initiatorsWhoSucceeded.Clear();
-        _playersWhoSkipped.Clear();
+        _playersWhoFinishedInitiating.Clear();
         PendingRequest = null;
         LastResolvedRequest = null;
     }
@@ -190,7 +190,7 @@ public sealed class TradePhaseCoordinator
             !_playerIds.Contains(initiatorId) ||
             !_playerIds.Contains(recipientId) ||
             _initiatorsWhoSucceeded.Contains(initiatorId) ||
-            _playersWhoSkipped.Contains(initiatorId))
+            _playersWhoFinishedInitiating.Contains(initiatorId))
         {
             return null;
         }
@@ -307,6 +307,9 @@ public sealed class TradePhaseCoordinator
 
         // 只有成功发起的一方会用掉主动机会；接收者仍可以之后主动发起另一笔交换。
         _initiatorsWhoSucceeded.Add(PendingRequest.InitiatorId);
+        // 成功交换已经完成了发起者本幕的主动操作，因此自动计为跳过后续操作，
+        // 让全局“跳过 x/y”进度前进，也避免他还需要手动点击跳过。
+        _playersWhoFinishedInitiating.Add(PendingRequest.InitiatorId);
         ResolvePendingRequest(TradeRequestStatus.Completed);
         UpdateCompletionStatus();
         return true;
@@ -338,7 +341,7 @@ public sealed class TradePhaseCoordinator
         if (Status != TradePhaseStatus.InProgress ||
             !_playerIds.Contains(playerId) ||
             _initiatorsWhoSucceeded.Contains(playerId) ||
-            _playersWhoSkipped.Contains(playerId) ||
+            _playersWhoFinishedInitiating.Contains(playerId) ||
             (PendingRequest is not null &&
              (string.Equals(PendingRequest.InitiatorId, playerId, StringComparison.Ordinal) ||
               string.Equals(PendingRequest.RecipientId, playerId, StringComparison.Ordinal))))
@@ -346,7 +349,7 @@ public sealed class TradePhaseCoordinator
             return false;
         }
 
-        _playersWhoSkipped.Add(playerId);
+        _playersWhoFinishedInitiating.Add(playerId);
         UpdateCompletionStatus();
         return true;
     }
@@ -356,7 +359,7 @@ public sealed class TradePhaseCoordinator
         Status == TradePhaseStatus.InProgress &&
         _playerIds.Contains(playerId) &&
         !_initiatorsWhoSucceeded.Contains(playerId) &&
-        !_playersWhoSkipped.Contains(playerId) &&
+        !_playersWhoFinishedInitiating.Contains(playerId) &&
         PendingRequest is null;
 
     /// <summary>查询指定玩家是否仍属于当前阶段。</summary>
@@ -398,8 +401,7 @@ public sealed class TradePhaseCoordinator
             return;
         }
 
-        bool everyPlayerFinishedInitiating = _playerIds.All(playerId =>
-            _initiatorsWhoSucceeded.Contains(playerId) || _playersWhoSkipped.Contains(playerId));
+        bool everyPlayerFinishedInitiating = _playerIds.All(_playersWhoFinishedInitiating.Contains);
 
         if (everyPlayerFinishedInitiating)
         {
